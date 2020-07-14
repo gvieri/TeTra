@@ -1,0 +1,442 @@
+--- record_text/main.c	2019-10-18 22:22:44.000000000 +0200
++++ covid19/main.c	2020-06-21 21:31:19.000000000 +0200
+@@ -1,5 +1,5 @@
+ /**
+- * Copyright (c) 2015 - 2019, Nordic Semiconductor ASA
++ * Copyright (c) 2014 - 2019, Nordic Semiconductor ASA
+  *
+  * All rights reserved.
+  *
+@@ -37,46 +37,137 @@
+  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  *
+  */
++/** @file
++ * @defgroup nrf_adc_example main.c
++ * @{
++ * @ingroup nrf_adc_example
++ * @brief ADC Example Application main file.
++ *
++ * This file contains the source code for a sample application using ADC.
++ *
++ * @image html example_board_setup_a.jpg "Use board setup A for this example."
++ */
++
++ /**
++  * UPDATE for Hackster.io hackaton test drive for TeTra
++  * Paolo Nenzi & Giovanbattista Vieri
++  * V 0.1 - 20200615.0.1
++  */
++
++#include <stdbool.h>
+ #include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <math.h>
++#include "nrf.h"
++#include "nrf_drv_saadc.h"
++#include "nrf_drv_ppi.h"
++#include "nrf_drv_timer.h"
++#include "boards.h"
++#include "app_error.h"
++#include "nrf_delay.h"
++#include "app_util_platform.h"
++#include "nrf_pwr_mgmt.h"
++
++/* PN: NFC Code */
+ #include "nfc_t2t_lib.h"
+ #include "nfc_ndef_msg.h"
+ #include "nfc_text_rec.h"
+-#include "boards.h"
+-#include "app_error.h"
+ #include "hardfault.h"
++/* PN: end NFC Code */
+ 
++/* PN: TEMP code */
++#include "nrf_temp.h"
++/* PN: end TEMP code */
+ 
+ #include "nrf_log.h"
+ #include "nrf_log_ctrl.h"
+ #include "nrf_log_default_backends.h"
+ 
+-#define MAX_REC_COUNT      3     /**< Maximum records count. */
++/* PN: NFC code */
++#define MAX_REC_COUNT      5     /**< Maximum records count. */ /* PN:temp code changed from 3 to 5*/
++/**
++/* PN: We use text messages to exchange data with the TOTEM */
++/* Messages are encoded as follows:
++/* Message 1 - token_ID  - in this implementation a static number will be used, in real world, it may contain a cryptographically secure ID
++/* Message 2 - IC_temp   - the nRF52480 device record its own temperature. This may be of interest for some applications
++/* Message 3 - body_temp - temperature of the sensor connected to the internal ADC
++/* Message 4 - reserved  - RESERVED for future expansions
++*/
+ 
+-/* Text message in English with its language code. */
+ /** @snippet [NFC text usage_1] */
+-static const uint8_t en_payload[] =
+-{
+-    'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'
+-};
++static const uint8_t token_ID_payload[] =
++//{'T', 'O', 'K', 'E', 'N', '_', 'I', 'D', '0', '0', '0', '1'};
++{'I','D','0', '0', '0', '1'};
++/* PN: initialize temperature to nonsense values */
++static  uint8_t ic_temp_payload[]   = {'_','_','_','_'};
++static  uint8_t body_temp_payload[] = {'_','_','_','_','_','_'};
++static  const uint8_t reserved_payload[]  = {'R','E','S','E','R','V','E','D'};
++/* Default Language - english */
+ static const uint8_t en_code[] = {'e', 'n'};
+-/** @snippet [NFC text usage_1] */
+-
+-/* Text message in Norwegian with its language code. */
+-static const uint8_t no_payload[] =
+-{
+-    'H', 'a', 'l', 'l', 'o', ' ', 'V', 'e', 'r', 'd', 'e', 'n', '!'
+-};
+-static const uint8_t no_code[] = {'N', 'O'};
+-
+-/* Text message in Polish with its language code. */
+-static const uint8_t pl_payload[] =
+-{
+-    'W', 'i', 't', 'a', 'j', ' ', 0xc5, 0x9a, 'w', 'i', 'e', 'c', 'i', 'e', '!'
+-};
+-static const uint8_t pl_code[] = {'P', 'L'};
+ 
+ /* Buffer used to hold an NFC NDEF message. */
+ uint8_t m_ndef_msg_buf[256];
++/* Temperature for body in mC */
++int32_t body_t;
++
++/* PN: end NFC code */
++
++
++/* PN: Temp code */
++#define ADC_REF_VOLTAGE_IN_MILLIVOLTS     600
++#define ADC_RES_10BIT                     1024   
++#define ADC_PRE_SCALING_COMPENSATION      6   
++#define ADC_RESULT_IN_MILLI_VOLTS(ADC_VALUE)\
++        ((((ADC_VALUE) * ADC_REF_VOLTAGE_IN_MILLIVOLTS) / ADC_RES_10BIT) * ADC_PRE_SCALING_COMPENSATION)
++/* PN: end Temp code */
++
++#define SAMPLES_IN_BUFFER 5
++volatile uint8_t state = 1;
++
++static const nrf_drv_timer_t m_timer = NRF_DRV_TIMER_INSTANCE(0);
++static nrf_saadc_value_t     m_buffer_pool[2][SAMPLES_IN_BUFFER];
++static nrf_ppi_channel_t     m_ppi_channel;
++static uint32_t              m_adc_evt_counter;
++
++
++void timer_handler(nrf_timer_event_t event_type, void * p_context)
++{
++
++}
++
++/**
++ * PN: Voltage to temperature °C x 1e-3 conversion for LMT86LP
++ */
++int32_t mV_toC(uint32_t adc_mV)
++{
++   /* See Page 10 of lmt86.pdf */
++   float const1 = 10.888;     /* 10.888 */
++   float const2 = 118.558544; /* -10.888 ^ 2 */
++   float const3 = 0.01388;    /* 4 * 0.00347 */
++   float const4 = -0.00694;   /* -2x0.00347 */
++   float temp;
++   int32_t temp_mC;
++
++   temp = 30 + (const1 - sqrt(const2+const3*(1777.3-adc_mV)))/const4;
++   temp_mC = (int)(temp *1000);
++   return temp_mC;
++
++}
++
++
++/**
++ *@brief Function for initializing logging.
++ */
++static void log_init(void)
++{
++    ret_code_t err_code = NRF_LOG_INIT(NULL);
++    APP_ERROR_CHECK(err_code);
++
++    NRF_LOG_DEFAULT_BACKENDS_INIT();
++}
++
++/* PN: NFC code */
+ 
+ /**
+  * @brief Callback function for handling NFC events.
+@@ -107,30 +198,39 @@
+     /** @snippet [NFC text usage_2] */
+     ret_code_t err_code;
+ 
+-    /* Create NFC NDEF text record description in English */
+-    NFC_NDEF_TEXT_RECORD_DESC_DEF(nfc_en_text_rec,
++    /* Create NFC NDEF text record for token ID */
++    NFC_NDEF_TEXT_RECORD_DESC_DEF(nfc_token_id_text_rec,
+                                   UTF_8,
+                                   en_code,
+                                   sizeof(en_code),
+-                                  en_payload,
+-                                  sizeof(en_payload));
++                                  token_ID_payload,
++                                  sizeof(token_ID_payload));
+     /** @snippet [NFC text usage_2] */
+ 
+-    /* Create NFC NDEF text record description in Norwegian */
+-    NFC_NDEF_TEXT_RECORD_DESC_DEF(nfc_no_text_rec,
++     /* Create NFC NDEF text record for IC temperature */
++    NFC_NDEF_TEXT_RECORD_DESC_DEF(nfc_IC_temp_rec,
+                                   UTF_8,
+-                                  no_code,
+-                                  sizeof(no_code),
+-                                  no_payload,
+-                                  sizeof(no_payload));
++                                  en_code,
++                                  sizeof(en_code),
++                                  ic_temp_payload,
++                                  sizeof(ic_temp_payload));
++    /** @snippet [NFC text usage_2] */
+ 
+-    /* Create NFC NDEF text record description in Polish */
+-    NFC_NDEF_TEXT_RECORD_DESC_DEF(nfc_pl_text_rec,
++    /* Create NFC NDEF text record for body temperature */
++    NFC_NDEF_TEXT_RECORD_DESC_DEF(nfc_body_temp_rec,
+                                   UTF_8,
+-                                  pl_code,
+-                                  sizeof(pl_code),
+-                                  pl_payload,
+-                                  sizeof(pl_payload));
++                                  en_code,
++                                  sizeof(en_code),
++                                  body_temp_payload,
++                                  sizeof(body_temp_payload));
++
++    /* Create NFC NDEF text record for reserved */
++    NFC_NDEF_TEXT_RECORD_DESC_DEF(nfc_reserved_rec,
++                                  UTF_8,
++                                  en_code,
++                                  sizeof(en_code),
++                                  reserved_payload,
++                                  sizeof(reserved_payload));
+ 
+     /* Create NFC NDEF message description, capacity - MAX_REC_COUNT records */
+     /** @snippet [NFC text usage_3] */
+@@ -140,14 +240,20 @@
+     /* Add text records to NDEF text message */
+     /** @snippet [NFC text usage_4] */
+     err_code = nfc_ndef_msg_record_add(&NFC_NDEF_MSG(nfc_text_msg),
+-                                       &NFC_NDEF_TEXT_RECORD_DESC(nfc_en_text_rec));
++                                       &NFC_NDEF_TEXT_RECORD_DESC(nfc_token_id_text_rec));
++    VERIFY_SUCCESS(err_code);
++    
++    /* temp *//** @snippet [NFC text usage_4] */
++    err_code = nfc_ndef_msg_record_add(&NFC_NDEF_MSG(nfc_text_msg),
++                                       &NFC_NDEF_TEXT_RECORD_DESC(nfc_IC_temp_rec));
+     VERIFY_SUCCESS(err_code);
++
+     /** @snippet [NFC text usage_4] */
+     err_code = nfc_ndef_msg_record_add(&NFC_NDEF_MSG(nfc_text_msg),
+-                                       &NFC_NDEF_TEXT_RECORD_DESC(nfc_no_text_rec));
++                                       &NFC_NDEF_TEXT_RECORD_DESC(nfc_body_temp_rec));
+     VERIFY_SUCCESS(err_code);
+     err_code = nfc_ndef_msg_record_add(&NFC_NDEF_MSG(nfc_text_msg),
+-                                       &NFC_NDEF_TEXT_RECORD_DESC(nfc_pl_text_rec));
++                                       &NFC_NDEF_TEXT_RECORD_DESC(nfc_reserved_rec));
+     VERIFY_SUCCESS(err_code);
+ 
+     /** @snippet [NFC text usage_5] */
+@@ -158,31 +264,127 @@
+     /** @snippet [NFC text usage_5] */
+ }
+ 
+-/**
+- *@brief Function for initializing logging.
+- */
+-static void log_init(void)
++/* PN: end NFC code */
++
++void saadc_sampling_event_init(void)
+ {
+-    ret_code_t err_code = NRF_LOG_INIT(NULL);
++    ret_code_t err_code;
++
++    err_code = nrf_drv_ppi_init();
++    APP_ERROR_CHECK(err_code);
++
++    nrf_drv_timer_config_t timer_cfg = NRF_DRV_TIMER_DEFAULT_CONFIG;
++    timer_cfg.bit_width = NRF_TIMER_BIT_WIDTH_32;
++    err_code = nrf_drv_timer_init(&m_timer, &timer_cfg, timer_handler);
++    APP_ERROR_CHECK(err_code);
++
++    /* setup m_timer for compare event every 400ms */
++    uint32_t ticks = nrf_drv_timer_ms_to_ticks(&m_timer, 400);
++    nrf_drv_timer_extended_compare(&m_timer,
++                                   NRF_TIMER_CC_CHANNEL0,
++                                   ticks,
++                                   NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK,
++                                   false);
++    nrf_drv_timer_enable(&m_timer);
++
++    uint32_t timer_compare_event_addr = nrf_drv_timer_compare_event_address_get(&m_timer,
++                                                                                NRF_TIMER_CC_CHANNEL0);
++    uint32_t saadc_sample_task_addr   = nrf_drv_saadc_sample_task_get();
++
++    /* setup ppi channel so that timer compare event is triggering sample task in SAADC */
++    err_code = nrf_drv_ppi_channel_alloc(&m_ppi_channel);
++    APP_ERROR_CHECK(err_code);
++
++    err_code = nrf_drv_ppi_channel_assign(m_ppi_channel,
++                                          timer_compare_event_addr,
++                                          saadc_sample_task_addr);
++    APP_ERROR_CHECK(err_code);
++}
++
++
++void saadc_sampling_event_enable(void)
++{
++    ret_code_t err_code = nrf_drv_ppi_channel_enable(m_ppi_channel);
++
++    APP_ERROR_CHECK(err_code);
++}
++
++
++void saadc_callback(nrf_drv_saadc_evt_t const * p_event)
++{
++    int32_t body_t_mV;
++    uint32_t body_t_adc;
++
++    if (p_event->type == NRF_DRV_SAADC_EVT_DONE)
++    {
++        ret_code_t err_code;
++
++        err_code = nrf_drv_saadc_buffer_convert(p_event->data.done.p_buffer, SAMPLES_IN_BUFFER);
++        APP_ERROR_CHECK(err_code);
++
++        int i;
++        NRF_LOG_INFO("ADC event number: %d", (int)m_adc_evt_counter);
++        body_t_adc = 0;
++        for (i = 0; i < SAMPLES_IN_BUFFER; i++)
++        {
++            NRF_LOG_INFO("%d", p_event->data.done.p_buffer[i]);
++            body_t_adc = body_t_adc + p_event->data.done.p_buffer[i];
++        }
++        body_t_adc = body_t_adc / i;
++        body_t_mV  = ADC_RESULT_IN_MILLI_VOLTS(body_t_adc);
++        body_t     = mV_toC(body_t_mV);
++        NRF_LOG_INFO("Body Temp Code: %d - %d (mV) - %d (mC)", body_t_adc, body_t_mV, body_t);
++        m_adc_evt_counter++;
++    }
++}
++
++
++void saadc_init(void)
++{
++    ret_code_t err_code;
++    nrf_saadc_channel_config_t channel_config =
++        NRF_DRV_SAADC_DEFAULT_CHANNEL_CONFIG_SE(NRF_SAADC_INPUT_AIN1);
++
++    err_code = nrf_drv_saadc_init(NULL, saadc_callback);
++    APP_ERROR_CHECK(err_code);
++
++    err_code = nrf_drv_saadc_channel_init(0, &channel_config);
++    APP_ERROR_CHECK(err_code);
++
++    err_code = nrf_drv_saadc_buffer_convert(m_buffer_pool[0], SAMPLES_IN_BUFFER);
++    APP_ERROR_CHECK(err_code);
++
++    err_code = nrf_drv_saadc_buffer_convert(m_buffer_pool[1], SAMPLES_IN_BUFFER);
+     APP_ERROR_CHECK(err_code);
+ 
+-    NRF_LOG_DEFAULT_BACKENDS_INIT();
+ }
+ 
+ 
+ /**
+- * @brief Function for application main entry.
++ * @brief Function for main application entry.
+  */
+ int main(void)
+ {
+     uint32_t  len = sizeof(m_ndef_msg_buf);
+     uint32_t  err_code;
+-
++    int32_t volatile temp; /* PN: temp code */
++//    uint32_t err_code = NRF_LOG_INIT(NULL);
++//    APP_ERROR_CHECK(err_code);
++//
++//    NRF_LOG_DEFAULT_BACKENDS_INIT();
+     log_init();
+ 
++    ret_code_t ret_code = nrf_pwr_mgmt_init();
++    APP_ERROR_CHECK(ret_code);
++    
++    /* PN: TEMP code */
++    nrf_temp_init();
++    APP_ERROR_CHECK(ret_code);
++    /* PN: end TEMP code */
++
++    /* PN: NFC code */
+     /* Configure LED-pins as outputs */
+     bsp_board_init(BSP_INIT_LEDS);
+-
+     /* Set up NFC */
+     err_code = nfc_t2t_setup(nfc_callback, NULL);
+     APP_ERROR_CHECK(err_code);
+@@ -199,10 +401,53 @@
+     err_code = nfc_t2t_emulation_start();
+     APP_ERROR_CHECK(err_code);
+ 
++    
++    /* PN: end NFC code */
++
++    saadc_init();
++    saadc_sampling_event_init();
++    saadc_sampling_event_enable();
++    NRF_LOG_INFO("SAADC HAL simple example started.");
++
+     while (1)
+     {
++        nrf_pwr_mgmt_run();
++        /* PN: Temp code */
++
++        NRF_TEMP->TASKS_START = 1;
++        /* Busy wait while temperature measurement is not finished, you can skip waiting if you enable interrupt for DATARDY event and read the result in the interrupt. */
++        /*lint -e{845} // A zero has been given as right argument to operator '|'" */
++        
++        /* PN: stop the communication of NFC data while updating temperature */
++        err_code = nfc_t2t_emulation_stop();
++        APP_ERROR_CHECK(err_code);
++
++        while (NRF_TEMP->EVENTS_DATARDY == 0)
++        {
++         /*  PN: Do nothing */
++        }
++        NRF_TEMP->EVENTS_DATARDY = 0;
++        /* PN: Temp code - temperature is returned as an INT. One unit equals 0.25 °C */
++        temp = (nrf_temp_read());
++        NRF_TEMP->TASKS_STOP = 1; /** Stop the temperature measurement. */
++        NRF_LOG_INFO("Actual temperature (x0.25) °C: %d", (int)temp);
++
++        /*PN: Update Message and restart code */
++        sprintf(ic_temp_payload, "%.4d", temp);
++        sprintf(body_temp_payload, "%.6d", body_t); 
++        err_code = welcome_msg_encode(m_ndef_msg_buf, &len);
++        APP_ERROR_CHECK(err_code);
++        err_code = nfc_t2t_payload_set(m_ndef_msg_buf, len);
++        APP_ERROR_CHECK(err_code);
++        err_code = nfc_t2t_emulation_start();
++        APP_ERROR_CHECK(err_code);
++
++        nrf_delay_ms(15000);
++        /* PN: End Temp Code */
++
+         NRF_LOG_FLUSH();
+-        __WFE();
+     }
+ }
+ 
++
++/** @} */
